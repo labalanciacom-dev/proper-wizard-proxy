@@ -7,8 +7,8 @@ import { Resend } from 'resend';
 
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'sales@labalancia.com').split(',').map(s=>s.trim()).filter(Boolean);
-const FROM_EMAIL   = process.env.FROM_EMAIL || 'LaBalancia <no-reply@yourdomain.com>';
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'kontakt@labalancia.com').split(',').map(s=>s.trim()).filter(Boolean);
+const FROM_EMAIL   = process.env.FROM_EMAIL || 'LaBalancia <no-reply@labalancia.com>';
 
 const SHOP_DOMAIN  = process.env.SHOPIFY_STORE_DOMAIN;             // e.g. labalancia.myshopify.com
 const SHOP_TOKEN   = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;    // Admin API token (scopes: read_customers, write_customers)
