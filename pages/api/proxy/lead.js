@@ -1,208 +1,242 @@
-// Next.js (Pages Router) API route
-// Görev: tema formundan gelen veriyi alır, Shopify CRM'e yazar (create/update + tag/note/metafield),
-// admin + müşteriye e-mail gönderir (Resend). CORS destekli.
+/* pages/api/proxy/lead.ts
+   LaBalancia — B2B Wizard lead endpoint (pages/api)
+   - CORS
+   - Shopify Admin: müşteri bul/oluştur + note/tags ekle
+   - E-posta: Resend (isteğe bağlı); yoksa atlamalı
+   - Dönen payload: { ok, customer_id, customer_created, mail_user, mail_admin }
+*/
 
-import { Resend } from 'resend';
+import type { NextApiRequest, NextApiResponse } from 'next';
 
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+// ---- ENV ----
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN!; // örn: my-store.myshopify.com
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN!;
+const SHOPIFY_API_VERSION  = process.env.SHOPIFY_API_VERSION || '2024-07';
 
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'sales@labalancia.com').split(',').map(s=>s.trim()).filter(Boolean);
-const FROM_EMAIL   = process.env.FROM_EMAIL || 'LaBalancia <no-reply@yourdomain.com>';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';              // İsterseniz SendGrid’e çeviririz
+const MAIL_FROM      = process.env.MAIL_FROM || 'no-reply@labalancia.com';
+const MAIL_TO_ADMIN  = process.env.MAIL_TO_ADMIN || 'b2b@labalancia.com';
 
-const SHOP_DOMAIN  = process.env.SHOPIFY_STORE_DOMAIN;             // e.g. labalancia.myshopify.com
-const SHOP_TOKEN   = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;    // Admin API token (scopes: read_customers, write_customers)
+// ---- Yardımcılar ----
+function sendJson(res: NextApiResponse, status: number, data: any) {
+  res.status(status).json(data);
+}
+function setCors(res: NextApiResponse) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Idempotency-Key, X-Shop-Origin');
+}
+function escapeHtml(s: string) {
+  return (s || '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
 
-// ---- Shopify helpers ----
-async function shopifyFetch(path, opts = {}) {
-  if (!SHOP_DOMAIN || !SHOP_TOKEN) throw new Error('Shopify env missing');
-  const url = `https://${SHOP_DOMAIN}/admin/api/2023-10${path}`;
+// ---- Shopify REST helpers ----
+async function shopifyFetch(path: string, init?: RequestInit) {
+  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}${path}`;
   const res = await fetch(url, {
-    ...opts,
+    ...init,
     headers: {
-      'X-Shopify-Access-Token': SHOP_TOKEN,
+      'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
       'Content-Type': 'application/json',
-      ...(opts.headers || {})
-    }
+      ...(init?.headers || {}),
+    },
   });
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`Shopify ${res.status}: ${txt}`);
+    throw new Error(`Shopify ${res.status} ${res.statusText}: ${txt}`);
   }
   return res.json();
 }
+async function findCustomerByEmail(email: string) {
+  const q = encodeURIComponent(`email:${email}`);
+  const data = await shopifyFetch(`/customers/search.json?query=${q}`, { method: 'GET' });
+  const customers = (data as any).customers || [];
+  return customers.length ? customers[0] : null;
+}
+async function createCustomer(payload: {
+  first_name?: string; last_name?: string; email: string; phone?: string; tags?: string[]; note?: string;
+}) {
+  const body = {
+    customer: {
+      first_name: payload.first_name,
+      last_name:  payload.last_name,
+      email:      payload.email,
+      phone:      payload.phone,
+      tags:       (payload.tags || []).join(', '),
+      note:       payload.note || '',
+      verified_email: true,
+      accepts_marketing: false,
+    },
+  };
+  const data = await shopifyFetch('/customers.json', { method: 'POST', body: JSON.stringify(body) });
+  return (data as any).customer;
+}
+async function updateCustomerNoteAndTags(customerId: number, addNote: string, addTags: string[]) {
+  const cur = await shopifyFetch(`/customers/${customerId}.json`, { method: 'GET' });
+  const current = (cur as any).customer;
 
-async function upsertShopifyCustomer({ name, email, phone, tags = [], note, metafieldPayload }) {
-  if (!email) return null;
+  const mergedTags = new Set<string>();
+  (current.tags || '').split(',').map((t: string) => t.trim()).filter(Boolean).forEach((t: string) => mergedTags.add(t));
+  addTags.forEach(t => mergedTags.add(t));
 
-  // 1) Search
-  let existing = null;
-  try {
-    const search = await shopifyFetch(`/customers/search.json?query=${encodeURIComponent('email:'+email)}`);
-    existing = Array.isArray(search?.customers) ? search.customers[0] : null;
-  } catch (e) { /* ignore */ }
+  const body = {
+    customer: {
+      id: customerId,
+      note: (current.note ? current.note + '\n' : '') + addNote,
+      tags: Array.from(mergedTags).join(', '),
+    },
+  };
+  await shopifyFetch(`/customers/${customerId}.json`, { method: 'PUT', body: JSON.stringify(body) });
+}
 
-  if (existing) {
-    // 2) Update (merge tags + append note)
-    const mergedTags = Array.from(new Set([...(existing.tags||'').split(',').map(t=>t.trim()).filter(Boolean), ...tags]));
-    const body = {
-      customer: {
-        id: existing.id,
-        phone: phone || existing.phone || undefined,
-        tags: mergedTags.join(','),
-        note: note ? `${(existing.note||'')}\n${note}`.trim() : existing.note
-      }
-    };
-    const upd = await shopifyFetch(`/customers/${existing.id}.json`, { method:'PUT', body: JSON.stringify(body) });
-
-    // 2b) Metafield
-    if (metafieldPayload) {
-      try {
-        await shopifyFetch(`/customers/${existing.id}/metafields.json`, {
-          method:'POST',
-          body: JSON.stringify({
-            metafield: {
-              namespace: 'lb',
-              key: 'wizard',
-              type: 'json',
-              value: JSON.stringify(metafieldPayload)
-            }
-          })
-        });
-      } catch (e) {
-        console.warn('metafield(post) failed', e.message);
-      }
-    }
-    return upd?.customer || existing;
-  }
-
-  // 3) Create
-  const create = await shopifyFetch(`/customers.json`, {
-    method:'POST',
-    body: JSON.stringify({
-      customer: {
-        first_name: name || '',
-        email, phone,
-        tags: tags.join(','),
-        note
-      }
-    })
+// ---- E-posta (Resend) ----
+async function sendEmailResend(to: string | string[], subject: string, html: string) {
+  if (!RESEND_API_KEY) return { ok: false, skipped: true, reason: 'RESEND_API_KEY missing' };
+  const recipients = Array.isArray(to) ? to : [to];
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: MAIL_FROM, to: recipients, subject, html }),
   });
-  const cust = create?.customer || null;
-
-  if (cust && metafieldPayload) {
-    try {
-      await shopifyFetch(`/customers/${cust.id}/metafields.json`, {
-        method:'POST',
-        body: JSON.stringify({
-          metafield: {
-            namespace: 'lb',
-            key: 'wizard',
-            type: 'json',
-            value: JSON.stringify(metafieldPayload)
-          }
-        })
-      });
-    } catch (e) {
-      console.warn('metafield(post-new) failed', e.message);
-    }
-  }
-
-  return cust;
+  const j = await res.json().catch(() => ({}));
+  return { ok: res.ok, response: j };
 }
 
-// ---- Email builders ----
-function buildAdminHtml({ answers, summary_html, host }) {
-  const safeSummary = summary_html || '<p>(brak podsumowania HTML)</p>';
-  return `
-    <div style="font-family:Inter,Arial,sans-serif">
-      <h2>Nowy lead z B2B Wizard (LaBalancia)</h2>
-      <p><b>Host:</b> ${host || '-'}</p>
-      <h3>Podsumowanie dla klienta</h3>
-      ${safeSummary}
-      <h3>Odpowiedzi (JSON)</h3>
-      <pre style="padding:12px;background:#f6f8fa;border-radius:8px;white-space:pre-wrap">${JSON.stringify(answers, null, 2)}</pre>
-    </div>
-  `;
+// ---- Not/Etiket & Mail HTML ----
+function buildSnapshotTag(answers: any) {
+  const parts: string[] = [];
+  if (answers.model) parts.push(`${answers.model}`);
+  if (answers.platform) parts.push(`${answers.platform}`);
+  if (answers.volume) parts.push(`${answers.volume}`);
+  return `B2B-QUIZ: ${parts.join(', ')}`;
 }
-
-function buildCustomerHtml({ summary_html }) {
+function buildNote(answers: any) {
+  const a = answers || {};
+  const L: string[] = [];
+  L.push('B2B Wizard — podsumowanie odpowiedzi:');
+  if (a.partner)       L.push(`Partner: ${a.partner}`);
+  if (a.sales_channel) L.push(`Kanał sprzedaży: ${a.sales_channel}`);
+  if (a.company)       L.push(`Firma: ${a.company}${a.company_other ? ' / ' + a.company_other : ''}`);
+  if (a.has_store)     L.push(`Sklep internetowy: ${a.has_store}${a.website_url ? ' (' + a.website_url + ')' : ''}`);
+  if (a.platform)      L.push(`Platforma: ${a.platform}${a.platform_other ? ' / ' + a.platform_other : ''}`);
+  if (a.baselinker)    L.push(`BaseLinker: ${a.baselinker}`);
+  if (a.marketplaces)  L.push(`Marketplace: ${Array.isArray(a.marketplaces) ? a.marketplaces.join(', ') : a.marketplaces}`);
+  if (a.model)         L.push(`Model: ${a.model}`);
+  if (a.volume)        L.push(`Wolumen: ${a.volume}`);
+  if (a.courier)       L.push(`Kurier: ${Array.isArray(a.courier) ? a.courier.join(', ') : a.courier}`);
+  return L.join('\n');
+}
+function buildUserEmailHtml(name: string, summaryHtml: string) {
+  const hello = name ? `Szanowny/a ${escapeHtml(name)},` : 'Dziękujemy,';
   return `
-    <div style="font-family:Inter,Arial,sans-serif">
-      <h2>Dziękujemy za wypełnienie ankiety 🎉</h2>
-      <p>Na podstawie Twoich odpowiedzi przygotowaliśmy wstępne rekomendacje. Skontaktujemy się
-      <b>najszybciej jak to możliwe</b>, aby potwierdzić kolejne kroki.</p>
-      ${summary_html || ''}
-      <p style="margin-top:24px;color:#555;font-size:13px">— Zespół LaBalancia</p>
-    </div>
-  `;
+  <div style="font-family:Inter,Arial,sans-serif;line-height:1.6;color:#111">
+    <p>${hello}</p>
+    <p>Dziękujemy za wypełnienie ankiety B2B. Poniżej przesyłamy podsumowanie rekomendacji oraz
+       kolejny krok. Skontaktujemy się z Tobą <strong>najszybciej jak to możliwe</strong>.</p>
+    <hr style="border:none;border-top:1px solid #eee;margin:16px 0" />
+    ${summaryHtml || '<p>(Brak podsumowania HTML)</p>'}
+    <hr style="border:none;border-top:1px solid #eee;margin:16px 0" />
+    <p>Masz pytania? Odpowiedz na tego maila — zespół LaBalancia.</p>
+  </div>`;
+}
+function buildAdminEmailHtml(payload: {
+  name: string; email: string; phone: string; answers: any; summary_html: string; shopifyCustomerId: number | null; isNew: boolean;
+}) {
+  const { name, email, phone, answers, summary_html, shopifyCustomerId, isNew } = payload;
+  return `
+    <div style="font-family:Inter,Arial,sans-serif;line-height:1.6;color:#111">
+      <h2>Nowe zgłoszenie — B2B Wizard</h2>
+      <p><strong>${escapeHtml(name)}</strong> &lt;${escapeHtml(email)}&gt; — tel. ${escapeHtml(phone)}</p>
+      <p>Shopify customer: ${shopifyCustomerId ?? '-'} ${isNew ? '(utworzony)' : ''}</p>
+      <h3>Odpowiedzi</h3>
+      <pre style="white-space:pre-wrap;background:#f7f7f8;border:1px solid #eee;padding:10px;border-radius:8px">${escapeHtml(JSON.stringify(answers, null, 2))}</pre>
+      <h3>Podsumowanie HTML</h3>
+      ${summary_html || '<p>(brak)</p>'}
+    </div>`;
 }
 
 // ---- Handler ----
-export default async function handler(req, res) {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Idempotency-Key, X-Shop-Origin');
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST')   return res.status(405).json({ ok:false, error:'Method not allowed' });
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  setCors(res);
+
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { ok: false, error: 'Method not allowed' });
+    return;
+  }
 
   try {
-    const { answers, summary_html } = req.body || {};
-    if (!answers) return res.status(400).json({ ok:false, error:'Missing answers' });
+    const { answers = {}, summary_html = '' } = (req.body || {});
+    const contact = answers.contact || {};
+    const name  = (contact.name || '').toString().trim();
+    const email = (contact.email || '').toString().trim().toLowerCase();
+    const phone = (contact.phone || '').toString().trim();
+    const consent = !!contact.consent;
 
-    const contact = answers?.contact || {};
-    const name  = contact?.name || '';
-    const email = contact?.email || '';
-    const phone = contact?.phone || '';
-    const consent = !!contact?.consent;
+    if (!name || !email || !phone || !consent) {
+      sendJson(res, 400, { ok: false, error: 'missing-contact' });
+      return;
+    }
 
-    const tags = ['lb_wizard'];
-    if (Array.isArray(answers.marketplaces) && answers.marketplaces.some(m=>m && m !== 'Nie')) tags.push('marketplace');
-    if (/Dropshipping/i.test(answers.model||'')) tags.push('dropshipping');
-    if (/hurt|Tylko hurt/i.test(answers.model||'')) tags.push('hurt');
-
-    const note = `B2B Wizard lead — ${new Date().toISOString()}
-Wolumen: ${answers.volume||'-'}
-Platforma: ${answers.platform||answers.platform_other||'-'}`;
-
-    const metafieldPayload = { answers, summary_html };
+    // isim split
+    const [first_name, ...rest] = name.split(' ');
+    const last_name = rest.join(' ') || '';
 
     // Shopify upsert
-    let shopifyCustomer = null;
+    let shopifyCustomerId: number | null = null;
+    let created = false;
+
     try {
-      shopifyCustomer = await upsertShopifyCustomer({ name, email, phone, tags, note, metafieldPayload });
-    } catch (e) {
-      console.error('Shopify upsert error', e.message);
-    }
-
-    // E-mail
-    const host = req.headers['x-shop-origin'] || req.headers.host || '';
-    const adminHtml = buildAdminHtml({ answers, summary_html, host });
-    const customerHtml = buildCustomerHtml({ summary_html });
-
-    if (resend) {
-      // Admin mail
-      await resend.emails.send({
-        from: FROM_EMAIL,
-        to: ADMIN_EMAILS,
-        subject: 'Nowy lead: B2B Wizard (LaBalancia)',
-        html: adminHtml
-      });
-      // Customer mail (yalnızca consent varsa)
-      if (email && consent) {
-        await resend.emails.send({
-          from: FROM_EMAIL,
-          to: email,
-          subject: 'Twoje rekomendacje – LaBalancia',
-          html: customerHtml
+      const existing = await findCustomerByEmail(email);
+      if (existing) {
+        shopifyCustomerId = existing.id;
+      } else {
+        const createdCust = await createCustomer({
+          first_name, last_name, email, phone,
+          tags: ['B2B-QUIZ'],
+          note: 'Zgłoszenie z ankiety B2B Wizard (LaBalancia)',
         });
+        shopifyCustomerId = createdCust.id;
+        created = true;
       }
-    } else {
-      console.warn('RESEND_API_KEY not set → email skipped');
+      const tag = buildSnapshotTag(answers);
+      const note = buildNote(answers);
+      if (shopifyCustomerId) {
+        await updateCustomerNoteAndTags(shopifyCustomerId, note, ['B2B-QUIZ', tag].filter(Boolean));
+      }
+    } catch (err: any) {
+      // Shopify hatası süreci öldürmesin
+      console.error('Shopify error:', err?.message || err);
     }
 
-    return res.status(200).json({ ok:true, customer_id: shopifyCustomer?.id || null });
-  } catch (err) {
-    console.error('lead handler error', err);
-    return res.status(500).json({ ok:false, error:'internal_error' });
+    // Mails
+    const userHtml  = buildUserEmailHtml(name, summary_html);
+    const adminHtml = buildAdminEmailHtml({ name, email, phone, answers, summary_html, shopifyCustomerId, isNew: created });
+
+    const mailUser  = await sendEmailResend(email, 'LaBalancia — Twoje rekomendacje i kolejny krok', userHtml);
+    const mailAdmin = await sendEmailResend(
+      MAIL_TO_ADMIN.split(',').map(s => s.trim()).filter(Boolean),
+      'Nowe zgłoszenie: B2B Wizard (LaBalancia)',
+      adminHtml
+    );
+
+    sendJson(res, 200, {
+      ok: true,
+      customer_id: shopifyCustomerId,
+      customer_created: created,
+      mail_user: mailUser,
+      mail_admin: mailAdmin,
+    });
+  } catch (e: any) {
+    console.error('lead error:', e?.message || e);
+    sendJson(res, 500, { ok: false, error: 'internal' });
   }
 }
