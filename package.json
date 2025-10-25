@@ -1,8 +1,17 @@
 {
   "name": "proper-wizard-proxy",
-  "private": true,
   "version": "1.0.0",
-  "scripts": { "dev": "next dev", "build": "next build", "start": "next start" },
-  "dependencies": { "next": "14.2.5", "react": "18.2.0", "react-dom": "18.2.0" },
-  "engines": { "node": ">=18.17.0" }
+  "private": true,
+  "engines": { "node": ">=18.17.0" },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start -p 3000"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "resend": "3.3.0"
+  }
 }
