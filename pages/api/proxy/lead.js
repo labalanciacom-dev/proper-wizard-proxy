@@ -211,7 +211,7 @@ export default async function handler(req, res) {
       const tag  = buildSnapshotTag(answers);
       const note = buildNote(answers);
       if (shopifyCustomerId) {
-        await updateCustomerNoteAndTags(shopifyCustomerId, note, ["B2B-QUIZ", tag].filter(Boolean));
+        await updateCustomerNoteAndTags(shopifyCustomerId, note, ['B2B-QUIZ', 'wizard-lead']);
       }
     } catch (err) {
       console.error("Shopify error:", err?.message || err);
