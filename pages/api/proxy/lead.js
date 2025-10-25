@@ -1,4 +1,3 @@
-// pages/api/proxy/lead.js
 // Next.js (Pages Router) API route
 // Görev: tema formundan gelen veriyi alır, Shopify CRM'e yazar (create/update + tag/note/metafield),
 // admin + müşteriye e-mail gönderir (Resend). CORS destekli.
@@ -7,8 +6,8 @@ import { Resend } from 'resend';
 
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'kontakt@labalancia.com').split(',').map(s=>s.trim()).filter(Boolean);
-const FROM_EMAIL   = process.env.FROM_EMAIL || 'LaBalancia <no-reply@labalancia.com>';
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'sales@labalancia.com').split(',').map(s=>s.trim()).filter(Boolean);
+const FROM_EMAIL   = process.env.FROM_EMAIL || 'LaBalancia <no-reply@yourdomain.com>';
 
 const SHOP_DOMAIN  = process.env.SHOPIFY_STORE_DOMAIN;             // e.g. labalancia.myshopify.com
 const SHOP_TOKEN   = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;    // Admin API token (scopes: read_customers, write_customers)
@@ -35,17 +34,15 @@ async function shopifyFetch(path, opts = {}) {
 async function upsertShopifyCustomer({ name, email, phone, tags = [], note, metafieldPayload }) {
   if (!email) return null;
 
-  // 1) Müşteri ara
+  // 1) Search
   let existing = null;
   try {
     const search = await shopifyFetch(`/customers/search.json?query=${encodeURIComponent('email:'+email)}`);
     existing = Array.isArray(search?.customers) ? search.customers[0] : null;
-  } catch (e) {
-    // search hata verirse bile create deneyeceğiz
-  }
+  } catch (e) { /* ignore */ }
 
   if (existing) {
-    // 2) Update (tag merge + note append)
+    // 2) Update (merge tags + append note)
     const mergedTags = Array.from(new Set([...(existing.tags||'').split(',').map(t=>t.trim()).filter(Boolean), ...tags]));
     const body = {
       customer: {
@@ -57,7 +54,7 @@ async function upsertShopifyCustomer({ name, email, phone, tags = [], note, meta
     };
     const upd = await shopifyFetch(`/customers/${existing.id}.json`, { method:'PUT', body: JSON.stringify(body) });
 
-    // 2b) Metafield (json)
+    // 2b) Metafield
     if (metafieldPayload) {
       try {
         await shopifyFetch(`/customers/${existing.id}/metafields.json`, {
@@ -72,7 +69,6 @@ async function upsertShopifyCustomer({ name, email, phone, tags = [], note, meta
           })
         });
       } catch (e) {
-        // metafield hatası kritik değil
         console.warn('metafield(post) failed', e.message);
       }
     }
@@ -93,7 +89,6 @@ async function upsertShopifyCustomer({ name, email, phone, tags = [], note, meta
   });
   const cust = create?.customer || null;
 
-  // 3b) Metafield
   if (cust && metafieldPayload) {
     try {
       await shopifyFetch(`/customers/${cust.id}/metafields.json`, {
@@ -160,10 +155,6 @@ export default async function handler(req, res) {
     const phone = contact?.phone || '';
     const consent = !!contact?.consent;
 
-    // (Opsiyonel) RODO: eğer consent yoksa e-mail göndermeyi atlamak istersen buradan kesebilirsin:
-    // if (!consent) return res.status(400).json({ ok:false, error:'consent_required' });
-
-    // tag & note
     const tags = ['lb_wizard'];
     if (Array.isArray(answers.marketplaces) && answers.marketplaces.some(m=>m && m !== 'Nie')) tags.push('marketplace');
     if (/Dropshipping/i.test(answers.model||'')) tags.push('dropshipping');
@@ -189,14 +180,14 @@ Platforma: ${answers.platform||answers.platform_other||'-'}`;
     const customerHtml = buildCustomerHtml({ summary_html });
 
     if (resend) {
-      // Admin
+      // Admin mail
       await resend.emails.send({
         from: FROM_EMAIL,
         to: ADMIN_EMAILS,
         subject: 'Nowy lead: B2B Wizard (LaBalancia)',
         html: adminHtml
       });
-      // Customer
+      // Customer mail (yalnızca consent varsa)
       if (email && consent) {
         await resend.emails.send({
           from: FROM_EMAIL,
